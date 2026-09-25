@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .booklet import ImpositionError, impose_booklet
+from .pedal_audit import PedalAuditError, PedalEvent, audit_pedal_log
 from .planner import Plan, PlanningError, plan_pages
 from .practice_route import PracticeRouteError, plan_practice_route
 from .practice_tabs import PracticeTabError, plan_practice_tabs
@@ -455,6 +456,120 @@ def _slot_to_out(slot: TurnSlot) -> TurnSlotOut:
         hand=slot.hand,
         action_start_seconds=slot.action_start_seconds,
         action_end_seconds=slot.action_end_seconds,
+    )
+
+
+# ---------------------------------------- 排练踏板日志校对
+
+
+class PedalEventIn(BaseModel):
+    """一条踏板操作日志：操作发生秒数与操作后页码。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seconds: float = Field(
+        ..., description="踏板操作发生时刻（秒，以演奏开始为 0），非负有限数值"
+    )
+    page_after: int = Field(
+        ...,
+        description="操作完成后所在的 1 基页码（须在 1..规划页数内）；与提示"
+        "的目标页相同才可能匹配",
+    )
+
+    @field_validator("page_after", mode="before")
+    @classmethod
+    def _reject_non_integer_page(cls, value: object) -> object:
+        """操作后页码必须是严格整数：拒绝浮点与布尔；范围由核心逻辑校验。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"操作后页码必须为整数（收到 {value!r}）")
+        return value
+
+
+class RehearsalPedalAuditRequest(RehearsalParams):
+    """排练踏板日志校对请求体（与定位/提示接口共用拍数、速度、重复段参数）。"""
+
+    pedal_events: List[PedalEventIn] = Field(
+        ...,
+        description="按时间非降序排列的踏板事件（秒数、操作后页码），可为空数组，"
+        "长度上限 500；秒数须落在 [0, 演奏总时长) 内",
+    )
+    tolerance_seconds: float = Field(
+        ..., description="非负时间容差（秒，有限数值）；时间差不超过容差才可能匹配"
+    )
+
+    @model_validator(mode="after")
+    def _validate_pedal_audit(self) -> "RehearsalPedalAuditRequest":
+        tol = self.tolerance_seconds
+        if tol != tol or tol in (float("inf"), float("-inf")):
+            raise ValueError("tolerance_seconds 必须是有限数值（不接受 NaN 或 Infinity）")
+        if tol < 0:
+            raise ValueError("tolerance_seconds（时间容差）不能为负数")
+        for i, event in enumerate(self.pedal_events):
+            seconds = event.seconds
+            if seconds != seconds or seconds in (float("inf"), float("-inf")):
+                raise ValueError(
+                    f"第 {i + 1} 个踏板事件秒数必须是有限数值"
+                    "（不接受 NaN 或 Infinity）"
+                )
+            if seconds < 0:
+                raise ValueError(
+                    f"第 {i + 1} 个踏板事件秒数不能为负数（实际 {seconds:g}）"
+                )
+        prev: Optional[float] = None
+        for i, event in enumerate(self.pedal_events):
+            if prev is not None and event.seconds < prev - 1e-9 * max(
+                1.0, abs(prev)
+            ):
+                raise ValueError(
+                    f"第 {i + 1} 个踏板事件秒数 {event.seconds:g} 早于上一条"
+                    f" {prev:g}：踏板事件必须按时间非降序排列"
+                )
+            prev = event.seconds
+        if len(self.pedal_events) > 500:
+            raise ValueError(
+                f"踏板事件数（{len(self.pedal_events)}）超过上限 500，无法校对"
+            )
+        return self
+
+
+class CueAuditOut(BaseModel):
+    """一条应翻页提示的校对结果。"""
+
+    cue_index: int = Field(..., description="应翻页提示在提示序列中的 0 基序号")
+    expected_seconds: float = Field(..., description="提示的边界时刻（秒）")
+    from_page: int = Field(..., description="提示的翻页前页码（1 基）")
+    to_page: int = Field(..., description="提示要求翻到的目标页（1 基）")
+    matched: bool = Field(..., description="是否匹配到一次踏板操作；false 即漏翻")
+    pedal_event_index: Optional[int] = Field(
+        ..., description="匹配到的踏板事件 0 基序号；漏翻为 null"
+    )
+    pedal_seconds: Optional[float] = Field(
+        ..., description="匹配踏板事件的操作时刻（秒）；漏翻为 null"
+    )
+    time_diff_seconds: Optional[float] = Field(
+        ..., description="匹配对的时间差绝对值（秒）；漏翻为 null"
+    )
+
+
+class RehearsalPedalAuditResponse(BaseModel):
+    id: str
+    request: RehearsalPedalAuditRequest
+    total_duration: float = Field(
+        ..., description="按重复段展开后的演奏总时长（秒）"
+    )
+    cue_audits: List[CueAuditOut] = Field(
+        ..., description="每条应翻页提示的匹配或漏翻结果（按提示顺序）"
+    )
+    extra_turns: List[int] = Field(
+        ..., description="未匹配踏板事件的 0 基序号（多翻，升序）"
+    )
+    missed_count: int = Field(..., description="漏翻数（未匹配提示数）")
+    extra_count: int = Field(..., description="多翻数（未匹配踏板事件数）")
+    total_error_count: int = Field(
+        ..., description="漏翻与多翻总数（第一项代价，全局最小）"
+    )
+    total_time_diff_seconds: float = Field(
+        ..., description="匹配时间差之和（第二项代价，在漏翻+多翻最少下全局最小）"
     )
 
 
@@ -1135,6 +1250,88 @@ def plan_rehearsal_turn_slots(
         request=payload,
         total_duration=rehearsal.total_duration,
         slots=[_slot_to_out(slot) for slot in slots],
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+    response_model=RehearsalPedalAuditResponse,
+)
+def audit_rehearsal_pedal_log(
+    plan_id: str, payload: RehearsalPedalAuditRequest
+) -> RehearsalPedalAuditResponse:
+    """为已保存方案校对排练踏板日志。
+
+    复用定位/提示接口的演奏顺序与时间轴，先用排练参数（每小节拍数、速度、
+    互不相交的重复段）生成含重复段回跳回翻的应翻页提示；再把按时间非降序
+    提交的踏板事件（秒数、操作后页码）与提示做全局一对一匹配——仅当目标页
+    相同且时间差不超过非负容差时允许匹配。依次最小化漏翻与多翻总数、匹配
+    时间差之和，仍并列取匹配的踏板事件序号序列字典序最小。返回每条提示的
+    匹配或漏翻、未匹配事件的多翻标记及两项代价。秒数越出演奏时长（含恰等
+    于总时长）或页码越出 1..规划页数的事件返回 422。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_request = PlanRequest(**record["request"])
+    plan_result = PlanResult(**record["result"])
+    page_starts = [p.start_measure for p in plan_result.pages]
+
+    try:
+        rehearsal = prepare_rehearsal(
+            measure_count=len(plan_request.measure_heights),
+            beats_per_measure=payload.beats_per_measure,
+            tempo_bpm=payload.tempo_bpm,
+            repeats=[
+                (r.start_measure, r.end_measure, r.play_count)
+                for r in payload.repeats
+            ],
+            page_starts=page_starts,
+        )
+        cues = rehearsal.turn_cues(
+            silences=plan_request.silence_seconds,
+            min_turn_time=plan_request.min_turn_time,
+        )
+        result = audit_pedal_log(
+            cue_seconds=[cue.boundary_seconds for cue in cues],
+            cue_to_pages=[cue.to_page for cue in cues],
+            cue_from_pages=[cue.from_page for cue in cues],
+            events=[
+                PedalEvent(seconds=e.seconds, page_after=e.page_after)
+                for e in payload.pedal_events
+            ],
+            total_duration=rehearsal.total_duration,
+            page_count=plan_result.page_count,
+            tolerance_seconds=payload.tolerance_seconds,
+        )
+    except (RehearsalError, PedalAuditError) as exc:
+        # 数组长度不符 / 重复段重叠 / 事件越界或非降序 / 容差为负：422
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return RehearsalPedalAuditResponse(
+        id=record["id"],
+        request=payload,
+        total_duration=result.total_duration,
+        cue_audits=[
+            CueAuditOut(
+                cue_index=a.cue_index,
+                expected_seconds=a.expected_seconds,
+                from_page=a.from_page,
+                to_page=a.to_page,
+                matched=a.matched,
+                pedal_event_index=a.pedal_event_index,
+                pedal_seconds=a.pedal_seconds,
+                time_diff_seconds=a.time_diff_seconds,
+            )
+            for a in result.cue_audits
+        ],
+        extra_turns=result.extra_turns,
+        missed_count=result.missed_count,
+        extra_count=result.extra_count,
+        total_error_count=result.total_error_count,
+        total_time_diff_seconds=result.total_time_diff_seconds,
     )
 
 
